@@ -73,7 +73,7 @@ sub register {
 	my ($vh, $cb, $iq) = @_;
 	if(($iq->isa("DJabberd::IQ") || $iq->isa("DJabberd::Presence") || $iq->isa("DJabberd::Message")) and defined $iq->from) {
 	    $logger->debug("Checking privacy for ".$iq->element_name);
-	    if($self->match_priv_list($vh,$iq)) {
+	    if($self->match_inflight_stanza($vh,$iq)) {
 		$self->block($vh,$iq);
 		$cb->stop_chain;
 		return;
@@ -417,6 +417,7 @@ sub match_priv_list {
     my $dir = shift || 'in';
     my $jidu = (($dir eq 'in')?$stanza->to_jid:$stanza->from_jid); # user's jid
     my $jido = (($dir eq 'in')?$stanza->from_jid:$stanza->to_jid); # other's jid
+    return 0 unless(exists $list->{items} && ref($list->{items}));
     # Iterate through all rules. Assume they are sorted already according to order attribute
     foreach my $item (@{$list->{items}}) {
 	# Rules could be stanza-specific or typeless (match-all)
@@ -437,12 +438,19 @@ sub match_priv_list {
 		# Group and subscription need to expand user's roster to check group membership or status
 		# However roster loading process could be timely, so either we need to preload rosters or
 		# we'd rather ignore group filters if none of the users is online. No harm unless we support XEP-0012
-		return $item->{action} eq 'deny' if(ritem_match($self->get_ritem($vhost,$jidu,$jido),$item));
+		if(ritem_match($self->get_ritem($vhost,$jidu,$jido),$item)) {
+		    $logger->debug("Roster match: ".$item->{type}."/".$item->{value}.", action ".$item->{action});
+		    return $item->{action} eq 'deny';
+		}
 	    } elsif($item->{type} eq 'jid') {
-		return $item->{action} eq 'deny' if(jid_match($jido,$item->{value}));
+		if(jid_match($jido,$item->{value})) {
+		    $logger->debug("JID[".$item->{value}."] match, action ".$item->{action});
+		    return $item->{action} eq 'deny';
+		}
 	    }
 	} else {
 	    # Unconditional match - catch-all
+	    $logger->debug("Catch-all match, action ".$item->{action});
 	    return $item->{action} eq 'deny';
 	}
     }
@@ -452,14 +460,14 @@ sub match_inflight_stanza {
     my $self = shift;
     my $vhost = shift;
     my $stanza = shift;
-    my $from = $stanza->from;
-    my $to = $stanza->to;
+    my $from = $stanza->from_jid;
+    my $to = $stanza->to_jid;
     my $ret = 0;
     my $list;
     # First check inbound stanzas - recipient's list if recipient is local
     $list = ($self->get_active_priv_list($to) || $self->get_default_priv_list($to)) if($vhost->handles_jid($to));
     # If we have a list - user wants to filter something
-    if(ref($list) eq 'HASH') {
+    if(ref($list) eq 'HASH' and exists $list->{name}) {
 	$logger->debug("Matching incoming traffic for ".$to->as_string." with ".$list->{name});
 	$ret = $self->match_priv_list($list,$stanza,$vhost);
     }
@@ -468,7 +476,7 @@ sub match_inflight_stanza {
     if(!$ret && $vhost->handles_jid($from)) {
 	$logger->debug("Outgoing check for ".$from->as_string);
 	$list = ($self->get_active_priv_list($from) || $self->get_default_priv_list($from));
-	if(ref($list) eq 'HASH') {
+	if(ref($list) eq 'HASH' and exists $list->{name}) {
 	    # Sender list exists - hence need to apply
 	    $logger->debug("Matching outgoing traffic for ".$from->as_string." with ".$list->{name});
 	    $ret = $self->match_priv_list($list,$stanza,$vhost,'out');

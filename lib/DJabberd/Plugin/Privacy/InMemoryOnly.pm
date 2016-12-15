@@ -36,6 +36,7 @@ sub get_priv_list {
 	foreach my$l($self->get_priv_lists($jid)) {
 	    return $l if(exists $l->{default} && $l->{default});
 	}
+	return {}; # make negative cache entry
     } else {
 	return $self->{mem}->{$jid->as_bare_string}->{$name};
     }
