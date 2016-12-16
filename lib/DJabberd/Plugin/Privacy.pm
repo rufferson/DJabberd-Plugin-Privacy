@@ -2,10 +2,7 @@ package DJabberd::Plugin::Privacy;
 
 use warnings;
 use strict;
-use feature 'current_sub';
 use base 'DJabberd::Plugin';
-
-use POSIX qw(strftime);
 
 use constant {
 	PRIVACY => "jabber:iq:privacy",
