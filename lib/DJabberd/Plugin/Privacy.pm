@@ -157,8 +157,8 @@ sub query_privacy {
 	my @lists = $self->get_priv_lists($jid);
 	my $default = $self->get_default_priv_list($jid);
 	my $active = $self->get_active_priv_list($jid);
-	$active = (ref($active)?'name="'.$active->{name}.'"':'');
-	$default = (ref($default)?'name="'.$default->{name}.'"':'');
+	$active = ((ref($active) eq 'HASH' && exists $active->{name})?'name="'.$active->{name}.'"':'');
+	$default = ((ref($default) eq 'HASH' && exists $default->{name})?'name="'.$default->{name}.'"':'');
 	my $xml = '<query xmlns="'.PRIVACY.'">';
 	$xml .= "<active $active/>";
 	$xml .= "<default $default/>";
@@ -232,6 +232,7 @@ sub set_privacy {
 				    if(exists $att{'{}type'}) {
 					$item->{type} = $att{'{}type'};
 					$item->{value} = $att{'{}value'};
+					# Group should be pre-validated. However one may delete it later, so who cares.
 				    }
 				    $item->{order} = $att{'{}order'};
 				    $item->{action} = $att{'{}action'};
@@ -310,7 +311,7 @@ sub is_cached_priv_list {
     my $self = shift;
     my $jids = shift;
     my $name = shift;
-    return (exists $self->{lists}->{$jids} && ref($self->{lists}->{$jids}) eq 'HASH' && $self->{lists}->{$jids}->{name} eq $name);
+    return (exists $self->{lists}->{$jids} && ref($self->{lists}->{$jids}) eq 'HASH' && exists $self->{lists}->{$jids}->{name} && $self->{lists}->{$jids}->{name} eq $name);
 }
 
 sub set_default_priv_list {
@@ -374,25 +375,31 @@ sub get_ritem {
     my $vhost = shift;
     my $jidu = shift;
     my $jido = shift;
-    my $d = { ritem => undef };
+    my $d = shift;
     if($jidu && $jido) {
 	$vhost->run_hook_chain(phase => "RosterLoadItem", args => [$jidu,$jido], methods => {
 	    error => sub {
 		$logger->error("RosterLoadItem failed: ".$_[0]);
 	    },
 	    set => sub {
-		$d->{rtiem} = $_[0];
+		my ($cb,$ri) = @_;
+		#$logger->debug("Retrieved RosterItem ".$ri->name." <".$ri->jid.">(".join(',',$ri->groups).")".$ri->subscription->as_string);
+		${$d} = $ri || 0;
 	    }
 	});
     }
-    return $d->{ritem};
+    $logger->debug("Returning with ".${$d});
+    return ${$d};
 }
 
-sub match_ritem {
+my %submap = ('none'=>0, 'to' => 1, 'from' => 2, 'both' => 3);
+sub ritem_match {
     my $ritem = shift;
     my $item = shift;
+    # If user is on roster - check attributes
     if($ritem && ref($ritem)) {
-	return 1 if($item->{type} eq 'subscription' and $ritem->subscription eq $item->{value});
+	# For subscription pending states are ignored, only facts matter
+	return 1 if($item->{type} eq 'subscription' and ($ritem->subscription->as_bitmask & 3) == $submap{$item->{value}});
 	return 1 if($item->{type} eq 'group' && grep {$_ eq $item->{value}} $ritem->groups);
     } elsif($item->{type} eq 'subscription' and $item->{value} eq 'none') {
 	# 'none' subsciption applies to unknown users (not in the roster) - XEP-0016 2.1
@@ -417,28 +424,33 @@ sub match_priv_list {
     my $dir = shift || 'in';
     my $jidu = (($dir eq 'in')?$stanza->to_jid:$stanza->from_jid); # user's jid
     my $jido = (($dir eq 'in')?$stanza->from_jid:$stanza->to_jid); # other's jid
+    my $ritem;
     return 0 unless(exists $list->{items} && ref($list->{items}));
+    $logger->debug("Checking ".scalar(@{$list->{items}})." privacy rules");
     # Iterate through all rules. Assume they are sorted already according to order attribute
     foreach my $item (@{$list->{items}}) {
 	# Rules could be stanza-specific or typeless (match-all)
-	if(ref($item->{element}) eq 'HASH' && @{$item->{element}}) {
+	if(ref($item->{element}) eq 'HASH' && %{$item->{element}}) {
 	    # Check if rule is typed - for specific stanza types
+	    #$logger->debug("Checking elements: ".join(',',keys(%{$item->{element}})));
 	    if($stanza->isa("DJabberd::Presence") && exists$item->{element}->{"presence-$dir"}) {
 		# XEP-0016 2.10, 2.11 - only ignore presence state, not probe/subscription
 		next if($stanza->type && $stanza->type ne 'unavailable');
 	    } else {
 		# skip this rule, it's typed but stanza type is different, or it's outbound
-		next if($dir eq 'out' or exists$item->{element}->{$stanza->element_name});
+		next if($dir eq 'out' or !$item->{element}->{$stanza->element_name});
 	    }
 	}
 	# Either untyped rule or with matching type, check conditions
 	# Conditions could be attribute specific or empty (match-any)
 	if(exists $item->{type} && $item->{type}) {
+	    #$logger->debug("Checking conditions: ".$item->{type}."=".$item->{value});
 	    if($item->{type} eq 'group' or $item->{type} eq 'subscription') {
 		# Group and subscription need to expand user's roster to check group membership or status
 		# However roster loading process could be timely, so either we need to preload rosters or
 		# we'd rather ignore group filters if none of the users is online. No harm unless we support XEP-0012
-		if(ritem_match($self->get_ritem($vhost,$jidu,$jido),$item)) {
+		$ritem = $self->get_ritem($vhost,$jidu,$jido,\$ritem) unless(defined $ritem);
+		if(ritem_match($ritem,$item)) {
 		    $logger->debug("Roster match: ".$item->{type}."/".$item->{value}.", action ".$item->{action});
 		    return $item->{action} eq 'deny';
 		}
@@ -474,7 +486,7 @@ sub match_inflight_stanza {
     # Now user may want to filter outbound as well. We have explicit presence-out case
     # Plus XEP-0016 2.13 clarifies that typeless rules also apply to any outgoing stanzas
     if(!$ret && $vhost->handles_jid($from)) {
-	$logger->debug("Outgoing check for ".$from->as_string);
+	#$logger->debug("Outgoing check for ".$from->as_string);
 	$list = ($self->get_active_priv_list($from) || $self->get_default_priv_list($from));
 	if(ref($list) eq 'HASH' and exists $list->{name}) {
 	    # Sender list exists - hence need to apply
