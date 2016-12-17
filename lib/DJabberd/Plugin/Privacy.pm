@@ -47,6 +47,7 @@ Register the vhost with the module.
 
 =cut
 
+use Data::Dumper;
 sub register {
     my ($self,$vhost) = @_;
     my $manage_cb = sub {
@@ -62,6 +63,15 @@ sub register {
 		$self->set_privacy($iq,$vh);
 		$cb->stop_chain;
 		return;
+	    } elsif($iq->signature eq 'get-{'.BLOCKING.'}blocklist') {
+		$logger->info("Blocking Query: ".$iq->as_xml);
+		$self->query_blocking($iq,$vh);
+		$self->{blkiq}->{$iq->from} = 1; # remember this one - block list user
+		$cb->stop_chain;
+	    } elsif($iq->signature eq 'set-{'.BLOCKING.'}block' or $iq->signature eq 'set-{'.BLOCKING.'}unblock') {
+		$logger->info("Blocking/Unblocking: ".$iq->as_xml);
+		$self->set_blocking($iq,$vh);
+		$cb->stop_chain;
 	    }
 	}
 	$cb->decline;
@@ -70,8 +80,8 @@ sub register {
 	my ($vh, $cb, $iq) = @_;
 	if(($iq->isa("DJabberd::IQ") || $iq->isa("DJabberd::Presence") || $iq->isa("DJabberd::Message")) and defined $iq->from) {
 	    $logger->debug("Checking privacy for ".$iq->element_name);
-	    if($self->match_inflight_stanza($vh,$iq)) {
-		$self->block($vh,$iq);
+	    if(my $jid = $self->match_inflight_stanza($vh,$iq)) {
+		$self->block($vh,$iq,$jid);
 		$cb->stop_chain;
 		return;
 	    }
@@ -82,15 +92,27 @@ sub register {
 	my ($vh, $cb, $conn, $pres) = @_;
 	# Remove active lists for closing sessions - if any
 	if($conn->isa("DJabberd::Connection::ClientIn")) {
-	    my $jid = $conn->bound_jid->as_string;
-	    delete $self->{lists}->{$jid} if(exists $self->{lists}->{$jid});
+	    my $jid = $conn->bound_jid;
+	    if($jid && ref($jid) && $jid->isa("DJabberd::JID")) {
+		my $jids = $jid->as_string;
+		# Active list - if any
+		delete $self->{lists}->{$jids} if(exists $self->{lists}->{$jids});
+		# Block List User
+		delete $self->{blkiq}->{$jids} if(exists $self->{blkiq}->{$jids});
+	    } else {
+		$logger->debug("No bound jid".Dumper($conn));
+	    }
+	} else {
+	    $logger->debug("Not a connection".Dumper($conn));
 	}
 	$cb->decline;
     };
     $vhost->register_hook("deliver",$filter_cb);
     $vhost->register_hook("switch_incoming_client",$manage_cb);
     $vhost->register_hook("AlterPresenceUnavailable",$cleanup_cb);
+    $vhost->register_hook("ConnectionClosing",$cleanup_cb);
     $vhost->add_feature(PRIVACY);
+    $vhost->add_feature(BLOCKING);
 }
 
 sub fail {
@@ -167,6 +189,29 @@ sub query_privacy {
     }
 }
 
+sub is_blocking_item {
+    my $item = shift;
+    # Type: JID; Action: Deny; Stanzas: All - that one is proper blocklist item. Anything else - does not comply, living in privacy list space only
+    return (exists $item->{type} && $item->{type} eq 'jid' && $item->{action} eq 'deny' && !($item->{elements} && ref($item->{elements}) eq 'HASH' && %{$item->{elements}}));
+}
+sub query_blocking {
+    my $self = shift;
+    my $iq = shift;
+    my $vhost = shift;
+    my $jid = $iq->connection->bound_jid;
+    my $bloxml;
+    my $list = $self->get_default_priv_list($jid);
+    if($list && ref($list) eq 'HASH' && exists $list->{name}) {
+	$logger->debug("Using default list ".$list->{name}." as blocklist");
+	foreach my $item(@{$list->{items}}) {
+	    if(is_blocking_item($item)) {
+		$bloxml = ($bloxml || "").'<item jid="'.$item->{value}.'"/>';
+	    }
+	}
+    }
+    $iq->send_result_raw($bloxml);
+}
+
 # TODO: XEP-0016 2.10 says we need to send presence unavailable to the client which just blocked incoming presence
 # tracking this though is a bit tough - user may set it right in active list or he may activate preset list
 sub set_privacy {
@@ -174,7 +219,7 @@ sub set_privacy {
     my $iq = shift;
     my $vhost = shift;
     my $jid = $iq->connection->bound_jid;
-    my @kids = grep {ref($_) && $_->element_name =~ /list|active|default/} $iq->first_element->children;
+    my @kids = grep {ref($_) && $_->element_name =~ /^(?:list|active|default)$/} $iq->first_element->children;
     if($#kids == 0) {
 	my $el = $kids[0];
 	if($el->element_name eq 'active' or $el->element_name eq 'default') {
@@ -289,6 +334,102 @@ sub set_privacy {
 	}
     }
     $self->fail($iq,0,'modify');
+}
+
+sub set_blocking {
+    my $self = shift;
+    my $iq = shift;
+    my $vhost = shift;
+    my $jid = $iq->connection->bound_jid;
+    my $op = $iq->first_element->element_name;
+    my @kids = grep {ref($_) && $_->element_name eq 'item'} $iq->first_element->children;
+    my $list = $self->get_default_priv_list($jid);
+    # If list is not set or defined - we need to auto-create it
+    my $active;
+    my @presence;
+    if($list && ref($list) eq 'HASH' && exists $list->{name}) {
+	$active = 1;
+    } else {
+	$list = { name => 'autoblocklist', items => []};
+    }
+    if($#kids >= 0) {
+	# We cannot unblock someone in empty list
+	if($op eq 'unblock' and !$active) {
+	    $logger->error("Selective unblock on empty list: ".$iq->as_xml);
+	    $self->fail($iq);
+	    return;
+	}
+	# Blocking elements should have higher precedence hence prepend them
+	foreach my $kid(@kids) {
+	    my $jid = DJbberd::JID->new($kid->attr('{}jid'));
+	    if($jid && ref($jid)) {
+		my $pst;
+		if($op eq 'block') {
+		    # prepend blocking items to the list
+		    unshift(@{$list->{items}},{type=>'jid',value=>$jid->as_string,action=>'deny'});
+		    # add unavailable presence for blocked contacts
+		    $pst = DJabberd::Presence->unavailable_stanza();
+		} else {
+		    # pull the needle from the haystack - very inefficicent
+		    $list->{items} = [ grep{!(is_blocking_item($_) && $_->{value} eq $jid->as_string)}@{$list->{items}} ];
+		    # add available presence for unblocked contacts
+		    $pst = DJabberd::Presence->available_stanza();
+		}
+		$pst->set_to($jid);
+		push(@presence,$pst);
+	    } else {
+		$self->fail($iq,'jid-malformed','modify');
+		return;
+	    }
+	}
+    } else {
+	# Unblock could be selective or (un)cover-all, block must be specific
+	if($op eq 'unblock') {
+	    if($active) {
+		# we have some list applied, let clean it up
+		my @items = @{$list->{items}};
+		$list->{items} = [];
+		# We need to iterate through the list since it may contain privacy items
+		foreach my$item(@items) {
+		    if(is_blocking_item($item)) {
+			my $pst = DJabberd::Presence->available_stanza();
+			$pst->set_to(DJabberd::JID->new($item->{value}));
+			push(@presence,$pst);
+		    } else {
+			# Return Privacy List item to the list
+			push(@{$list->{items}},$item);
+		    }
+		}
+	    }
+	} else {
+	    $self->fail($iq);
+	    return;
+	}
+    }
+    # And yes, XEP-0191 allows updating list which is in use, just notify users
+    $self->set_default_priv_list($jid,$list);
+    # Even if we fail to persistently store it - list will still be cached and hence active, so let's ack it
+    $iq->send_result;
+    # Broadcast modifications to all connected resources
+    # Those which requested block list - receive original change [XEP-0191 3.3.8], others - priv.list name [XEP-0016 2.6]
+    $iq->set_from;
+    my $piq = DJabberd::IQ->new('','iq',{type=>'set'},[],'<query xmlns="'.PRIVACY.'"><list name="'.$list->{name}.'" /></query>') if($active);
+    foreach my $c ($vhost->find_conns_of_bare($jid)) {
+	next if($c->bound_jid->as_string eq $jid->as_string);
+	if($self->{blkiq}->{$c->bound_jid->as_string}) {
+	    $iq->set_to($c->bound_jid);
+	    $iq->deliver($c);
+	} elsif($piq) {
+	    # I wonder how these guys would react to someone updating list in use
+	    $piq->set_to($c->bound_jid);
+	    $piq->deliver($c);
+	}
+    }
+    # send presence to all affected blocks (if they are subscribed)
+    # TODO: get roster and check presence subscription
+    foreach my $pst(@presence) {
+	$pst->deliver($vhost);
+    }
 }
 
 sub set_active_priv_list {
@@ -471,14 +612,16 @@ sub match_inflight_stanza {
     my $stanza = shift;
     my $from = $stanza->from_jid;
     my $to = $stanza->to_jid;
-    my $ret = 0;
+    my $ret;
     my $list;
+    # Specification explicitly denies blocking cross-resource stanzas, even if explicit list item is defined.
+    return 0 if($from->as_bare_string eq $to->as_bare_string);
     # First check inbound stanzas - recipient's list if recipient is local
     $list = ($self->get_active_priv_list($to) || $self->get_default_priv_list($to)) if($vhost->handles_jid($to));
     # If we have a list - user wants to filter something
     if(ref($list) eq 'HASH' and exists $list->{name}) {
 	$logger->debug("Matching incoming traffic for ".$to->as_string." with ".$list->{name});
-	$ret = $self->match_priv_list($list,$stanza,$vhost);
+	$ret = $to if($self->match_priv_list($list,$stanza,$vhost));
     }
     # Now user may want to filter outbound as well. We have explicit presence-out case
     # Plus XEP-0016 2.13 clarifies that typeless rules also apply to any outgoing stanzas
@@ -488,7 +631,7 @@ sub match_inflight_stanza {
 	if(ref($list) eq 'HASH' and exists $list->{name}) {
 	    # Sender list exists - hence need to apply
 	    $logger->debug("Matching outgoing traffic for ".$from->as_string." with ".$list->{name});
-	    $ret = $self->match_priv_list($list,$stanza,$vhost,'out');
+	    $ret = $from if($self->match_priv_list($list,$stanza,$vhost,'out'));
 	}
     }
     return $ret;
@@ -498,6 +641,7 @@ sub block {
     my $self = shift;
     my $vhost = shift;
     my $stanza = shift;
+    my $owner = shift;
     $logger->info("BOOM! Stanza is blocked: ".$stanza->as_xml);
     # Be polite and compliant - send responses as perscribed in XEP-0016 2.14
     # Presence - ignore (drop)
@@ -506,7 +650,15 @@ sub block {
     if(($stanza->isa("DJabber::Message") and $stanza->type ne 'groupchat')
 	or ($stanza->isa("DJabberd::IQ") and $stanza->type eq 'get' || $stanza->type eq 'set'))
     {
-	my $err = $stanza->make_error_response(503,'cancel','service-unavailable');
+	my $err;
+	if($owner && $stanza->from_jid->as_bare_string eq $owner->as_bare_string && $stanza->isa("DJabber::Message")) {
+	    # XEP-0191 mandates to inform blocker with other error type as well as app-specific blocking condition
+	    $err = $stanza->make_error_response(503,'cancel','not-acceptable');
+	    my @err = grep{$_->element_name eq 'error'}$err->children;
+	    $err[0]->push_child(DJabberd::XMLElement->new(BLOCKING.':errors','blocked',{},[]));
+	} else {
+	    $err = $stanza->make_error_response(503,'cancel','service-unavailable');
+	}
 	$err->deliver;
     }
 }
