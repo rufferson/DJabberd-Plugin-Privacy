@@ -13,7 +13,8 @@ our $logger = DJabberd::Log->get_logger();
 
 =head1 NAME
 
-DJabberd::Plugin::Privacy - Implements XEP-0016 Privacy Lists
+DJabberd::Plugin::Privacy - Implements XEP-0016 Privacy Lists and XEP-0191
+Blocking Command.
 
 =head1 VERSION
 
@@ -25,25 +26,84 @@ our $VERSION = '0.01';
 
 =head1 SYNOPSIS
 
-Implements XEP-0016 Privacy Lists - a part of XMPP Advanced Server specification.
+Implements XEP-0016 Privacy Lists and XEP-0191 Blocking Command - a part of
+XMPP Advanced Server [2010, 2016] specification.
+
+Interoperability between XEP 0016 and 0191 is performed according to XEP-0191
+recommendations. That is - when 0016 Privacy List is set as default - it's used
+for blocking commands, where blocks are represented as
+C<E<lt>item type='jid' value='node@domain/resource' action='deny' /E<gt>>
 
     <VHost mydomain.com>
 	<Plugin DJabberd::Plugin::Privacy />
 	<Plugin DJabberd::... other delivery plugins: Local, S2S, Offline />
     </VHost>
 
-The base implementation will merely advertise feature and respond to basic management
-commands. Not being able to store the list it will never filter. Use storage-enabled
-overriden implementation instead.
+The base implementation will merely advertise feature and respond to basic
+management commands. Not being able to store the list it will never filter.
+Use storage-enabled overriden implementation instead.
+
+In cotrast Blocking Command [XEP-0191] uses simplistic list management hence
+even storageless bare implementation will use in-memory cache for blocking.
 
 Make sure privacy is the first delivery plugin ever. It registers delivery hook
 and according to XEP-0016 it MUST the very first delivery rule [2.2.4].
+
+Internally list structure is represented as HASH reference with following layout
+
+
+  {
+    name => 'listname',
+    items => [
+      { # item 1
+	action => '<allow|deny>',
+	type => '<jid|group|subscription>', value => '<value>', # optional
+	elements => {		# optional, with any combination of below
+	  iq => 1,
+	  message => 1,
+	  'presence-in' => 1,
+	  'presence-out' => 1
+	}
+      },
+      # ... item 2, ..., n
+    ],
+    default => 1  # optional flag for default list
+  }
+
+Blocking Command being subset of privacy list will then be shortened to
+
+  {
+    name => 'listname',
+    items => [
+      {
+	action => 'deny',
+	type => 'jid',
+	value => '<jid>'
+      }
+    ]
+  }
+
+with all fields in list item being mandatory to comply with blocking command.
+List may contain any mix of both, but only later will be visible in blocking
+query, while full list will be visible to privacy query.
+
+=cut
+
+=head1 METHODS
+
+Most of the methods defined here are object methods requireing object context.
+Only small number of small utilitary calls are static class methods.
 
 =cut
 
 =head2 register($self, $vhost)
 
-Register the vhost with the module.
+Registers the vhost with the module. Installs hooks in client-connection
+incoming processing chain for the management, connection tear-down chain
+for cache purging and delivery chain for actual blocking/filtering.
+
+Additionally adds server features for the implemented XEPs: jabber:iq:privacy
+and urn:xmpp:blocking
 
 =cut
 
@@ -115,6 +175,29 @@ sub register {
     $vhost->add_feature(BLOCKING);
 }
 
+=head2 fail($self, $stanza, $subject, $error, $text)
+
+The call used internally to generate error response for management commands.
+
+=over
+
+=item
+$stanza - is origignal stanza which triggerred an error.
+
+=item
+$subject - is child element of type urn:ietf:params:xml:ns:xmpp-stanzas,
+default is 'bad-request'
+
+=item
+$error is error type, default is 'cancel'
+
+=item
+$text is optional text payload describing the error condition.
+
+=back
+
+=cut
+
 sub fail {
     my $self =   shift;
     my $stanza = shift;
@@ -130,6 +213,16 @@ sub fail {
 	.'</error>'
     );
 }
+
+=head2 query_privacy($self, $iq)
+
+This method is called for privacy lists query IQ. IQ may request a list of lists
+or details of some specific named list. Will fail if query contains more than
+one element (eg. multiple lists). Also when requested list does not exist.
+
+Empty request will list all lists.
+
+=cut
 
 sub query_privacy {
     my $self = shift;
@@ -194,6 +287,16 @@ sub is_blocking_item {
     # Type: JID; Action: Deny; Stanzas: All - that one is proper blocklist item. Anything else - does not comply, living in privacy list space only
     return (exists $item->{type} && $item->{type} eq 'jid' && $item->{action} eq 'deny' && !($item->{elements} && ref($item->{elements}) eq 'HASH' && %{$item->{elements}}));
 }
+
+=head2 query_blocking($self,$iq)
+
+This method is called for Blocking Command query IQ. IQ may only request a list
+of currently installed blocking commands.
+
+Should be empty although this method ignores any child elements.
+
+=cut
+
 sub query_blocking {
     my $self = shift;
     my $iq = shift;
@@ -211,6 +314,61 @@ sub query_blocking {
     }
     $iq->send_result_raw($bloxml);
 }
+
+=head2 set_privacy($self,$iq)
+
+used as a handler for privacy list modification IQ stanzas.
+
+May be used to:
+
+=over
+
+=item
+create new or overwrite existing list.
+
+=over
+
+Full list specification should be provided hence these operations are equal.
+If the list in question is set as either active or default for active session
+- returns E<lt>conflict/E<gt> error.
+
+=back
+
+=item
+remove the list.
+
+=over
+
+Submitting empty list specification removes the list. Same conditions as for
+list modification apply.
+
+=back
+
+=item
+set active list.
+
+=over
+
+List should exist. Active list is having highest priority but is used only for
+the time of the session. If list attribute is empty - deactivates a list for
+current session.
+
+=back
+
+=item
+set default list.
+
+=over
+
+List should exist. Default list is used for all sessions with no active list
+set. Moreover, it's used even for offline delivery. If list attribute is empty
+- detaches a list from default filter.
+
+=back
+
+=back
+
+=cut
 
 # TODO: XEP-0016 2.10 says we need to send presence unavailable to the client which just blocked incoming presence
 # tracking this though is a bit tough - user may set it right in active list or he may activate preset list
@@ -336,6 +494,25 @@ sub set_privacy {
     $self->fail($iq,0,'modify');
 }
 
+=head2 set_blocking($self,$iq)
+
+The method is used as a handler for Blocking list management.
+
+In contrast to privacy lists - blocking command allows partial modification of
+the list - to add or remove blocking elements.
+Since the plugin is used for both privacy and blocking list - blocking sits on
+top of privacy. Privacy list allows more granular control, with blocking being
+a subset of privacy. Hence this handler will attempt to modify default privacy
+list, or will autocreate one for addition command.
+
+The handler attempts to not interfere with list elements which do not conform
+to blocking commands. This is checked by L<is_blocking_item> call.
+
+The method will generate error response for attempts to remove elements from an
+empty list, or to add empty elements, or to block wrongly formatted JIDs.
+
+=cut
+
 sub set_blocking {
     my $self = shift;
     my $iq = shift;
@@ -432,25 +609,60 @@ sub set_blocking {
     }
 }
 
+=head2 set_active_priv_list($self,$jid,$list)
+
+The method is activating given list for the given JID.
+
+The JID is DJabberd::JID object and should be fully qualified
+(node@domain/resource). Method installs the list in memory cache.
+The cache will be purged by tear-down hooks.
+
+The list is represented by HASH reference as specified above.
+
+=cut
+
 sub set_active_priv_list {
     my $self = shift;
     my $jid = shift;
     my $list = shift;
-    $self->{lists}->{$jid->as_bare_string} = $list;
+    $self->{lists}->{$jid->as_string} = $list;
 }
+
+=head2 get_active_priv_list($self,$jid)
+
+returns active privacy list for the given JID.
+
+The JID is DJabberd::JID object and should be fully qualified
+(node@domain/resource). Method checks for existance in memory cache. Returns
+empty
+
+
+=cut
+
 sub get_active_priv_list {
     my $self = shift;
     my $jid = shift;
-    # Active list is session-bound hence runtime-only parameter
-    return $self->{lists}->{$jid->as_bare_string} if(exists $self->{lists}->{$jid->as_bare_string} && ref($self->{lists}->{$jid->as_bare_string}));
+    # Active list is session-bound hence runtime-only parameter and for fully qualified JID
+    return $self->{lists}->{$jid->as_string} if(exists $self->{lists}->{$jid->as_string} && ref($self->{lists}->{$jid->as_string}));
     return undef;
 }
+
 sub is_cached_priv_list {
     my $self = shift;
     my $jids = shift;
     my $name = shift;
     return (exists $self->{lists}->{$jids} && ref($self->{lists}->{$jids}) eq 'HASH' && exists $self->{lists}->{$jids}->{name} && $self->{lists}->{$jids}->{name} eq $name);
 }
+
+=head2 set_default_priv_list($self,$jid,$list)
+
+installs given list as default for given JID.
+
+The $jid should be DJabberd::JID and $list a hash ref - either empty or normal.
+The list is installed in memory cache, then flagged as default and stored to
+persistent storage.
+
+=cut
 
 sub set_default_priv_list {
     my $self = shift;
@@ -461,6 +673,19 @@ sub set_default_priv_list {
     $self->{lists}->{$jid->as_bare_string} = $list;
     return $self->store_priv_list($jid,$list);
 }
+
+=head2 get_default_priv_list($self,$jid)
+
+returns default privacy list for the given JID.
+
+The $jid is DJabberd::JID object. If default list is pre-cached - returns it
+straight from there. Otherwise queries persistent storage to retrieve any
+list which is marked as default for given JID.
+
+Storage call may return empty hash ref to stop querying itself.
+
+=cut
+
 sub get_default_priv_list {
     my $self = shift;
     my $jid = shift;
@@ -470,6 +695,17 @@ sub get_default_priv_list {
     $self->{lists}->{$jid->as_bare_string} = $list if($list && ref($list) eq 'HASH');
     return $list;
 }
+
+=head2 set_priv_list($self,$jid,$list)
+
+Stores the list into persistent storage for given JID.
+
+The JID must be DJabberd::JID object and the list a hashref. If the list with
+this name is cached as active or default - will also update the cache.
+
+If the hashref is empty - indicates removal of the list.
+
+=cut
 
 sub set_priv_list {
     my $self = shift;
@@ -483,12 +719,36 @@ sub set_priv_list {
     }
 }
 
+=head2 get_priv_lists($self,$jid,$name)
+
+directly calls persistent storage to fetch all jid's lists
+
+MUST OVERRIDE. Base class will just print an error message.
+$jid is DJabberd::JID object for which the list of privacy lists is fetched.
+
+Returns array of the hashrefs.
+
+=cut
+
 sub get_priv_lists {
     my $self = shift;
     my $jid = shift;
     $logger->error("Not Implemented: Must Override");
     return ();
 }
+
+=head2 store_priv_list($self,$jid,$list)
+
+directly calls persistent storage to store the list
+
+MUST OVERRIDE. Base class will just print an error message.
+$jid is DJabberd::JID object and $list is hashref. The call is used to push
+the list to the storage backend, used in other methods which are checking for
+cache. This one is only storing. Or removing - if hashref has no items.
+
+Returns stored list hashref if succeeded, undef otherwise.
+
+=cut
 
 sub store_priv_list {
     my $self = shift;
@@ -497,6 +757,22 @@ sub store_priv_list {
     $logger->error("Not Implemented: Must Override");
     return undef;
 }
+
+=head2 get_priv_list($self,$jid,$name,$def)
+
+directly calls persistent storage to fetch the named list for given jid.
+
+MUST OVERRIDE. Base class will just print an error message.
+$jid is DJabberd::JID object for which the list with name $name is fetched.
+
+Optional boolean $def may be used to filter by default flag instead of name.
+$name is ignored in this case and call effectively returns default list only,
+if it exists.
+
+The call should return empty hash ref to indicate negative search result which
+could be cached. returned undef would indicate storage failure.
+
+=cut
 
 sub get_priv_list {
     my $self = shift;
@@ -507,7 +783,22 @@ sub get_priv_list {
     return undef;
 }
 
-# One may override it with cache-able call but then need to invalidate on roster updates
+=head2 get_ritem($self,$vhost,$user,$contact,$out)
+
+returns RosterItem for the contact from user's Roster
+
+The call is used to fetch DJabberd::RosterItem from $user's Roster for the given
+$contact. $user and $contact are both DJabberd::JID objects.
+
+Since it uses RosterLoadItem hook with callback it needs external variable to
+prevent closure to localize the variable. Hence $out param is passed as var ref
+to set the resulting RosterItem, however it still returns that item in the end.
+
+One may override it with cache-able call but then need to invalidate on roster
+updates.
+
+=cut
+
 sub get_ritem {
     my $self = shift;
     my $vhost = shift;
@@ -553,6 +844,26 @@ sub jid_match {
 	|| (!$jid->is_bare && $jid->domain.'/'.$jid->resource eq $str)	# <domain/resource> (only that resource matches)
 	|| $jid->domain eq $str;	# <domain> (the domain itself matches, as does any user@domain or domain/resource)
 }
+
+=head2 match_priv_list($self,$list,$stanza,$vhost,$dir)
+
+applies the list to the stanza to find matches for the give direction
+
+This is the main matching _engine_ used for privacy list filtering.
+The $list should be a hashref which was identified as an active or default
+list applicable to the delivered $stanza - a DJabberd::Stanza or derived
+object. The $vhost parameter is required to retrieve a RosterItem if list
+contains roster-dependent filters (subscription or group). $dir is a string
+saying whether we're checking inbound ('in' - default) or outbound ('out')
+direction.
+
+Returns boolean which indicates whether the list directs to deny (true) or
+allow (false) the stanza.
+
+Note: default (no-match) action for privacy list is allow, so false means
+ether explicit allow-match or no-match.
+
+=cut
 
 sub match_priv_list {
     my $self = shift;
@@ -606,6 +917,22 @@ sub match_priv_list {
     }
     return 0;
 }
+
+=head2 match_inflight_stanza($self,$vhost,$stanza)
+
+The method represents a hook injected by L<register> method into delivery chain.
+
+called for each and every stanza which requires delivery.
+First it trise to identify privacy list for recipient and apply the list for
+inbound direction. If no deny found, it then attempts to identify list for the
+sender and apply found list in outbound direction.
+
+If neither of matches returns deny condition - the chain continues. Otherwise
+the delivery is stopped and L<block> method is called to drop the stanza or
+reject it wth an error.
+
+=cut
+
 sub match_inflight_stanza {
     my $self = shift;
     my $vhost = shift;
@@ -636,6 +963,19 @@ sub match_inflight_stanza {
     }
     return $ret;
 }
+
+=head2 block($self,$vhost,$stanza,$owner)
+
+Handles block action when privacy list or block command directs deny action.
+
+The method should provide proper rejection mechanism as per XEP-0016 and
+XEP-0191 to apply deny action for matched list. $vhost is DJabberd::VHost
+object which may be used to deliver messages, $stanza is blocked $stanza
+object of DJabberd::Stanza or derived class which matched the privacy list
+with deny action. $owner is DJabberd::JID object whose privacy list generated
+deny action.
+
+=cut
 
 sub block {
     my $self = shift;
