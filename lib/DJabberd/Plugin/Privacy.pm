@@ -48,47 +48,7 @@ even storageless bare implementation will use in-memory cache for blocking.
 
 Make sure privacy is the first delivery plugin ever. It registers delivery hook
 and according to XEP-0016 it MUST the very first delivery rule [2.2.4].
-
-Internally list structure is represented as HASH reference with following layout
-
-
-  {
-    name => 'listname',
-    items => [
-      { # item 1
-	action => '<allow|deny>',
-	type => '<jid|group|subscription>', value => '<value>', # optional
-	elements => {		# optional, with any combination of below
-	  iq => 1,
-	  message => 1,
-	  'presence-in' => 1,
-	  'presence-out' => 1
-	}
-      },
-      # ... item 2, ..., n
-    ],
-    default => 1  # optional flag for default list
-  }
-
-Blocking Command being subset of privacy list will then be shortened to
-
-  {
-    name => 'listname',
-    items => [
-      {
-	action => 'deny',
-	type => 'jid',
-	value => '<jid>'
-      }
-    ]
-  }
-
-with all fields in list item being mandatory to comply with blocking command.
-List may contain any mix of both, but only later will be visible in blocking
-query, while full list will be visible to privacy query.
-
 =cut
-
 =head1 METHODS
 
 Most of the methods defined here are object methods requireing object context.
@@ -115,33 +75,53 @@ sub register {
 	if($iq->isa("DJabberd::IQ") && !$iq->to) {
 	    if ($iq->signature eq 'get-{'.PRIVACY.'}query') {
 		$logger->debug("Privacy Query: ".$iq->as_xml);
-		$self->query_privacy($iq,$vh);
+		$self->query_privacy($iq);
 		$cb->stop_chain;
 		return;
 	    } elsif ($iq->signature eq 'set-{'.PRIVACY.'}query') {
 		$logger->debug("Privacy Modify: ".$iq->as_xml);
-		$self->set_privacy($iq,$vh);
+		$self->set_privacy($iq);
 		$cb->stop_chain;
 		return;
 	    } elsif($iq->signature eq 'get-{'.BLOCKING.'}blocklist') {
 		$logger->info("Blocking Query: ".$iq->as_xml);
-		$self->query_blocking($iq,$vh);
+		$self->query_blocking($iq);
 		$self->{blkiq}->{$iq->from} = 1; # remember this one - block list user
 		$cb->stop_chain;
 	    } elsif($iq->signature eq 'set-{'.BLOCKING.'}block' or $iq->signature eq 'set-{'.BLOCKING.'}unblock') {
 		$logger->info("Blocking/Unblocking: ".$iq->as_xml);
-		$self->set_blocking($iq,$vh);
+		$self->set_blocking($iq);
 		$cb->stop_chain;
+	    } elsif(($iq->isa("DJabberd::IQ") || $iq->isa("DJabberd::Presence") || $iq->isa("DJabberd::Message")) and defined $iq->to) {
+		$logger->debug("I:Checking privacy for ".$iq->element_name);
+		if(my $jid = $self->match_inflight_stanza($iq,'I')) {
+		    $self->block($iq,$jid);
+		    $cb->stop_chain;
+		    return;
+		}
 	    }
 	}
 	$cb->decline;
     };
     my $filter_cb = sub {
+	my ($vh, $cb, $gt) = @_;
+	my $iq = $gt->();
+	if($iq->connection->isa('DJabberd::Connection::ClientIn') && ($iq->isa("DJabberd::IQ") || $iq->isa("DJabberd::Presence") || $iq->isa("DJabberd::Message")) and defined $iq->from) {
+	    $logger->debug("O:Checking privacy for ".$iq->element_name);
+	    if(my $jid = $self->match_inflight_stanza($iq,'O')) {
+		$self->block($iq,$jid);
+		$cb->stop_chain;
+		return;
+	    }
+	}
+	$cb->decline;
+    };
+    my $deliver_cb = sub {
 	my ($vh, $cb, $iq) = @_;
-	if(($iq->isa("DJabberd::IQ") || $iq->isa("DJabberd::Presence") || $iq->isa("DJabberd::Message")) and defined $iq->from) {
-	    $logger->debug("Checking privacy for ".$iq->element_name);
-	    if(my $jid = $self->match_inflight_stanza($vh,$iq)) {
-		$self->block($vh,$iq,$jid);
+	if(($iq->isa("DJabberd::IQ") || $iq->isa("DJabberd::Presence") || $iq->isa("DJabberd::Message")) && defined $iq->from && defined $iq->to) {
+	    $logger->debug("D:Checking privacy for ".$iq->element_name);
+	    if(my $jid = $self->match_inflight_stanza($iq)) {
+		$self->block($iq,$jid);
 		$cb->stop_chain;
 		return;
 	    }
@@ -159,20 +139,30 @@ sub register {
 		delete $self->{lists}->{$jids} if(exists $self->{lists}->{$jids});
 		# Block List User
 		delete $self->{blkiq}->{$jids} if(exists $self->{blkiq}->{$jids});
-	    } else {
-		$logger->debug("No bound jid".Dumper($conn));
+	    #} else {
+		#$logger->debug("No bound jid".Dumper($conn));
 	    }
-	} else {
-	    $logger->debug("Not a connection".Dumper($conn));
+	#} else {
+	#    $logger->debug("Not a connection".Dumper($conn));
 	}
 	$cb->decline;
     };
-    $vhost->register_hook("deliver",$filter_cb);
+    $self->{vhost} = $vhost;
+    # Hook used mostly for default list and s2s delivery
+    $vhost->register_hook("deliver",$deliver_cb);
+    # Hook used mostly for active list inbound filtering
+    $vhost->register_hook("pre_stanza_write",$filter_cb);
+    # Hook used for management and outbound filtering
     $vhost->register_hook("switch_incoming_client",$manage_cb);
+    # Hooks used to clean up any associated cached elements
     $vhost->register_hook("AlterPresenceUnavailable",$cleanup_cb);
     $vhost->register_hook("ConnectionClosing",$cleanup_cb);
     $vhost->add_feature(PRIVACY);
     $vhost->add_feature(BLOCKING);
+}
+
+sub vhost {
+    return $_[0]->{vhost};
 }
 
 =head2 fail($self, $stanza, $subject, $error, $text)
@@ -300,7 +290,6 @@ Should be empty although this method ignores any child elements.
 sub query_blocking {
     my $self = shift;
     my $iq = shift;
-    my $vhost = shift;
     my $jid = $iq->connection->bound_jid;
     my $bloxml;
     my $list = $self->get_default_priv_list($jid);
@@ -375,7 +364,6 @@ set. Moreover, it's used even for offline delivery. If list attribute is empty
 sub set_privacy {
     my $self = shift;
     my $iq = shift;
-    my $vhost = shift;
     my $jid = $iq->connection->bound_jid;
     my @kids = grep {ref($_) && $_->element_name =~ /^(?:list|active|default)$/} $iq->first_element->children;
     if($#kids == 0) {
@@ -398,7 +386,7 @@ sub set_privacy {
 		# If default list is defined and differs from this one
 		if($def && ref($def) eq 'HASH' && $def->{name} ne $name) {
 		    # Need to check for conflicts - don't change default in use by other connected users (silly)
-		    foreach my $c($vhost->find_conns_of_bare($jid)) {
+		    foreach my $c($self->vhost->find_conns_of_bare($jid)) {
 			# basically we're checking if other resources having own(active) list or rely on default
 			my $bj=$c->bound_jid->as_string;
 			next if(exists $self->{$bj} && ref($self->{$bj}) eq 'HASH'); # this one has active, skip
@@ -461,7 +449,7 @@ sub set_privacy {
 		    my $def = $self->get_default_priv_list($jid);
 		    $def=($def && $def->{name} eq $name);
 		    # Then check other online resources
-		    foreach my $c($vhost->find_conns_of_bare($jid)) {
+		    foreach my $c($self->vhost->find_conns_of_bare($jid)) {
 			my $bj=$c->bound_jid->as_string;
 			# If uses our list as active OR doesn't use active but our is default - it's a conflict
 			if((exists $self->{$bj} && ref($self->{$bj}) eq 'HASH' && $self->{$bj}->{name} eq $name)
@@ -475,9 +463,8 @@ sub set_privacy {
 		if(my$sr=$self->set_priv_list($jid,$list)) {
 		    if($sr>0) {
 			# Broadcast modified list name to all connected resources (XEP-0016 2.6)
-			my $piq = DJabberd::IQ->new('','iq',{type=>'set'},[],'<query xmlns="'.PRIVACY.'"><list name="'.$name.'" /></query>');
-			foreach my $c ($vhost->find_conns_of_bare($jid)) {
-			    next if($c->bound_jid->as_string eq $jid->as_string);
+			my $piq = DJabberd::IQ->new('','iq',{type=>'set'},[],"<query xmlns='".PRIVACY."'><list name='$name' /></query>");
+			foreach my $c ($self->vhost->find_conns_of_bare($jid)) {
 			    $piq->set_to($c->bound_jid);
 			    $piq->deliver($c);
 			}
@@ -516,7 +503,6 @@ empty list, or to add empty elements, or to block wrongly formatted JIDs.
 sub set_blocking {
     my $self = shift;
     my $iq = shift;
-    my $vhost = shift;
     my $jid = $iq->connection->bound_jid;
     my $op = $iq->first_element->element_name;
     my @kids = grep {ref($_) && $_->element_name eq 'item'} $iq->first_element->children;
@@ -591,7 +577,7 @@ sub set_blocking {
     # Those which requested block list - receive original change [XEP-0191 3.3.8], others - priv.list name [XEP-0016 2.6]
     $iq->set_from;
     my $piq = DJabberd::IQ->new('','iq',{type=>'set'},[],'<query xmlns="'.PRIVACY.'"><list name="'.$list->{name}.'" /></query>') if($active);
-    foreach my $c ($vhost->find_conns_of_bare($jid)) {
+    foreach my $c ($self->vhost->find_conns_of_bare($jid)) {
 	next if($c->bound_jid->as_string eq $jid->as_string);
 	if($self->{blkiq}->{$c->bound_jid->as_string}) {
 	    $iq->set_to($c->bound_jid);
@@ -605,7 +591,7 @@ sub set_blocking {
     # send presence to all affected blocks (if they are subscribed)
     # TODO: get roster and check presence subscription
     foreach my $pst(@presence) {
-	$pst->deliver($vhost);
+	$pst->deliver($self->vhost);
     }
 }
 
@@ -783,7 +769,7 @@ sub get_priv_list {
     return undef;
 }
 
-=head2 get_ritem($self,$vhost,$user,$contact,$out)
+=head2 get_ritem($self,$user,$contact,$out)
 
 returns RosterItem for the contact from user's Roster
 
@@ -801,12 +787,11 @@ updates.
 
 sub get_ritem {
     my $self = shift;
-    my $vhost = shift;
     my $jidu = shift;
     my $jido = shift;
     my $d = shift;
     if($jidu && $jido) {
-	$vhost->run_hook_chain(phase => "RosterLoadItem", args => [$jidu,$jido], methods => {
+	$self->vhost->run_hook_chain(phase => "RosterLoadItem", args => [$jidu,$jido], methods => {
 	    error => sub {
 		$logger->error("RosterLoadItem failed: ".$_[0]);
 	    },
@@ -845,14 +830,14 @@ sub jid_match {
 	|| $jid->domain eq $str;	# <domain> (the domain itself matches, as does any user@domain or domain/resource)
 }
 
-=head2 match_priv_list($self,$list,$stanza,$vhost,$dir)
+=head2 match_priv_list($self,$list,$stanza,$dir)
 
 applies the list to the stanza to find matches for the give direction
 
 This is the main matching _engine_ used for privacy list filtering.
 The $list should be a hashref which was identified as an active or default
 list applicable to the delivered $stanza - a DJabberd::Stanza or derived
-object. The $vhost parameter is required to retrieve a RosterItem if list
+object. The contact's RosterItem will be fetched from user's roster if list
 contains roster-dependent filters (subscription or group). $dir is a string
 saying whether we're checking inbound ('in' - default) or outbound ('out')
 direction.
@@ -869,7 +854,6 @@ sub match_priv_list {
     my $self = shift;
     my $list = shift;
     my $stanza = shift;
-    my $vhost = shift;
     my $dir = shift || 'in';
     my $jidu = (($dir eq 'in')?$stanza->to_jid:$stanza->from_jid); # user's jid
     my $jido = (($dir eq 'in')?$stanza->from_jid:$stanza->to_jid); # other's jid
@@ -898,7 +882,7 @@ sub match_priv_list {
 		# Group and subscription need to expand user's roster to check group membership or status
 		# However roster loading process could be timely, so either we need to preload rosters or
 		# we'd rather ignore group filters if none of the users is online. No harm unless we support XEP-0012
-		$ritem = $self->get_ritem($vhost,$jidu,$jido,\$ritem) unless(defined $ritem);
+		$ritem = $self->get_ritem($jidu,$jido,\$ritem) unless(defined $ritem);
 		if(ritem_match($ritem,$item)) {
 		    $logger->debug("Roster match: ".$item->{type}."/".$item->{value}.", action ".$item->{action});
 		    return $item->{action} eq 'deny';
@@ -918,14 +902,18 @@ sub match_priv_list {
     return 0;
 }
 
-=head2 match_inflight_stanza($self,$vhost,$stanza)
+=head2 match_inflight_stanza($self,$stanza,$dir)
 
-The method represents a hook injected by L<register> method into delivery chain.
+The method represents a hook injected by L<register> method into delivery chains
 
-called for each and every stanza which requires delivery.
-First it trise to identify privacy list for recipient and apply the list for
+called for each and every stanza which requires delivery. Additionally checks
+client connections for incoming and outgoing stanzas - to apply active list.
+First it tries to identify privacy list for recipient and apply the list for
 inbound direction. If no deny found, it then attempts to identify list for the
 sender and apply found list in outbound direction.
+
+Optional $fdir parameter is used to enforce direction and to/from jid - this is
+used when filtering c2s connection.
 
 If neither of matches returns deny condition - the chain continues. Otherwise
 the delivery is stopped and L<block> method is called to drop the stanza or
@@ -935,42 +923,41 @@ reject it wth an error.
 
 sub match_inflight_stanza {
     my $self = shift;
-    my $vhost = shift;
     my $stanza = shift;
-    my $from = $stanza->from_jid;
-    my $to = $stanza->to_jid;
+    my $fdir = shift || "";
+    my $from = ($fdir eq 'I') ? $stanza->connection->bound_jid : $stanza->from_jid;
+    my $to =   ($fdir eq 'O') ? $stanza->connection->bound_jid : $stanza->to_jid;
     my $ret;
     my $list;
     # Specification explicitly denies blocking cross-resource stanzas, even if explicit list item is defined.
     return 0 if($from->as_bare_string eq $to->as_bare_string);
     # First check inbound stanzas - recipient's list if recipient is local
-    $list = ($self->get_active_priv_list($to) || $self->get_default_priv_list($to)) if($vhost->handles_jid($to));
+    $list = ($self->get_active_priv_list($to) || $self->get_default_priv_list($to)) if($fdir ne 'I' && $self->vhost->handles_jid($to));
     # If we have a list - user wants to filter something
     if(ref($list) eq 'HASH' and exists $list->{name}) {
 	$logger->debug("Matching incoming traffic for ".$to->as_string." with ".$list->{name});
-	$ret = $to if($self->match_priv_list($list,$stanza,$vhost));
+	$ret = $to if($self->match_priv_list($list,$stanza));
     }
     # Now user may want to filter outbound as well. We have explicit presence-out case
     # Plus XEP-0016 2.13 clarifies that typeless rules also apply to any outgoing stanzas
-    if(!$ret && $vhost->handles_jid($from)) {
+    if(!$ret && $fdir ne 'O' && $self->vhost->handles_jid($from)) {
 	#$logger->debug("Outgoing check for ".$from->as_string);
 	$list = ($self->get_active_priv_list($from) || $self->get_default_priv_list($from));
 	if(ref($list) eq 'HASH' and exists $list->{name}) {
 	    # Sender list exists - hence need to apply
 	    $logger->debug("Matching outgoing traffic for ".$from->as_string." with ".$list->{name});
-	    $ret = $from if($self->match_priv_list($list,$stanza,$vhost,'out'));
+	    $ret = $from if($self->match_priv_list($list,$stanza,'out'));
 	}
     }
     return $ret;
 }
 
-=head2 block($self,$vhost,$stanza,$owner)
+=head2 block($self,$stanza,$owner)
 
 Handles block action when privacy list or block command directs deny action.
 
 The method should provide proper rejection mechanism as per XEP-0016 and
-XEP-0191 to apply deny action for matched list. $vhost is DJabberd::VHost
-object which may be used to deliver messages, $stanza is blocked $stanza
+XEP-0191 to apply deny action for matched list. $stanza is blocked $stanza
 object of DJabberd::Stanza or derived class which matched the privacy list
 with deny action. $owner is DJabberd::JID object whose privacy list generated
 deny action.
@@ -979,19 +966,18 @@ deny action.
 
 sub block {
     my $self = shift;
-    my $vhost = shift;
     my $stanza = shift;
     my $owner = shift;
     $logger->info("BOOM! Stanza is blocked: ".$stanza->as_xml);
     # Be polite and compliant - send responses as perscribed in XEP-0016 2.14
     # Presence - ignore (drop)
-    return if($stanza->isa("DJabber::Presence"));
+    return if($stanza->isa("DJabberd::Presence"));
     # Message and IQ{get|set} - error <service-unavailable/>, drop others
-    if(($stanza->isa("DJabber::Message") and $stanza->type ne 'groupchat')
+    if(($stanza->isa("DJabberd::Message") and $stanza->type ne 'groupchat')
 	or ($stanza->isa("DJabberd::IQ") and $stanza->type eq 'get' || $stanza->type eq 'set'))
     {
 	my $err;
-	if($owner && $stanza->from_jid->as_bare_string eq $owner->as_bare_string && $stanza->isa("DJabber::Message")) {
+	if($owner && $stanza->from_jid->as_bare_string eq $owner->as_bare_string && $stanza->isa("DJabberd::Message")) {
 	    # XEP-0191 mandates to inform blocker with other error type as well as app-specific blocking condition
 	    $err = $stanza->make_error_response(503,'cancel','not-acceptable');
 	    my @err = grep{$_->element_name eq 'error'}$err->children;
@@ -1002,6 +988,48 @@ sub block {
 	$err->deliver;
     }
 }
+
+=head1 INTERNALS
+
+Internally list structure is represented as HASH reference with following layout
+
+
+  {
+    name => 'listname',
+    items => [
+      { # item 1
+	action => '<allow|deny>',
+	type => '<jid|group|subscription>', value => '<value>', # optional
+	elements => {		# optional, with any combination of below
+	  iq => 1,
+	  message => 1,
+	  'presence-in' => 1,
+	  'presence-out' => 1
+	}
+      },
+      # ... item 2, ..., n
+    ],
+    default => 1  # optional flag for default list
+  }
+
+Blocking Command being subset of privacy list will then be shortened to
+
+  {
+    name => 'listname',
+    items => [
+      {
+	action => 'deny',
+	type => 'jid',
+	value => '<jid>'
+      }
+    ]
+  }
+
+with all fields in list item being mandatory to comply with blocking command.
+List may contain any mix of both, but only later will be visible in blocking
+query, while full list will be visible to privacy query.
+
+=cut
 
 =head1 AUTHOR
 
