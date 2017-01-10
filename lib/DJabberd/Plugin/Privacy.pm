@@ -56,6 +56,17 @@ Only small number of small utilitary calls are static class methods.
 
 =cut
 
+=head2 run_before()
+
+Static class method indicating this hook should run before attempt to deliver
+the stanza either locally or via s2s. Namely returns a list containing modules
+'DJabberd::Delivery::Local' and 'DJabberd::Delivery::S2S'.
+
+=cut
+sub run_before {
+    return qw(DJabberd::Delivery::Local DJabberd::Delivery::S2S);
+}
+
 =head2 register($self, $vhost)
 
 Registers the vhost with the module. Installs hooks in client-connection
@@ -461,15 +472,20 @@ sub set_privacy {
 		}
 		# Try to store list
 		if(my$sr=$self->set_priv_list($jid,$list)) {
+		    # first ack result back to editor
+		    $iq->send_result();
 		    if($sr>0) {
-			# Broadcast modified list name to all connected resources (XEP-0016 2.6)
-			my $piq = DJabberd::IQ->new('','iq',{type=>'set'},[],"<query xmlns='".PRIVACY."'><list name='$name' /></query>");
+			# Then broadcast modified list name to all connected resources (XEP-0016 2.6)
+			my $lq = "<query xmlns='".PRIVACY."'><list name='$name' /></query>";
 			foreach my $c ($self->vhost->find_conns_of_bare($jid)) {
-			    $piq->set_to($c->bound_jid);
-			    $piq->deliver($c);
+			    # Need to follow roster push way as initial presence might not yet be sent
+			    my $id = $c->new_iq_id;
+			    my $to = $c->bound_jid->as_string;
+			    my $xml = "<iq type='set' to='$to' id='$id'>$lq</iq>";
+			    $c->log_outgoing_data($xml);
+			    $c->write(\$xml);
 			}
 		    }
-		    $iq->send_result();
 		} else {
 		    # happens
 		    $self->fail('service-unavailable');
