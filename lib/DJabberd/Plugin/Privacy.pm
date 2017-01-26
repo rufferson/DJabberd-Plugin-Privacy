@@ -6,15 +6,16 @@ use base 'DJabberd::Plugin';
 
 use constant {
 	PRIVACY => "jabber:iq:privacy",
-	BLOCKING => "urn:xmpp:blocking"
+	BLOCKING => "urn:xmpp:blocking",
+	INVISIBLE => "urn:xmpp:invisible:0",
 };
 
 our $logger = DJabberd::Log->get_logger();
 
 =head1 NAME
 
-DJabberd::Plugin::Privacy - Implements XEP-0016 Privacy Lists and XEP-0191
-Blocking Command.
+DJabberd::Plugin::Privacy - Privacy Lists [XEP-0016], Invisible Command
+[XEP-0186, XEP-0126] and Blocking Commands [XEP-0191]
 
 =head1 VERSION
 
@@ -26,13 +27,14 @@ our $VERSION = '0.01';
 
 =head1 SYNOPSIS
 
-Implements XEP-0016 Privacy Lists and XEP-0191 Blocking Command - a part of
-XMPP Advanced Server [2010, 2016] specification.
+Implements XEP-0016 Privacy Lists, XEP-0186 Invisible Command and XEP-0191
+Blocking Command - a part of XMPP Advanced Server [2010, 2016] specification.
 
 Interoperability between XEP 0016 and 0191 is performed according to XEP-0191
 recommendations. That is - when 0016 Privacy List is set as default - it's used
 for blocking commands, where blocks are represented as
-C<E<lt>item type='jid' value='node@domain/resource' action='deny' /E<gt>>
+C<E<lt>item type='jid' value='node@domain/resource' action='deny' /E<gt>>.
+Interoperability between XEP-0016 and 0186 is implemented according to XEP-0126
 
     <VHost mydomain.com>
 	<Plugin DJabberd::Plugin::Privacy />
@@ -103,13 +105,17 @@ sub register {
 		$logger->info("Blocking/Unblocking: ".$iq->as_xml);
 		$self->set_blocking($iq);
 		$cb->stop_chain;
-	    } elsif(($iq->isa("DJabberd::IQ") || $iq->isa("DJabberd::Presence") || $iq->isa("DJabberd::Message")) and defined $iq->to) {
-		$logger->debug("I:Checking privacy for ".$iq->element_name);
-		if(my $jid = $self->match_inflight_stanza($iq,'I')) {
-		    $self->block($iq,$jid);
-		    $cb->stop_chain;
-		    return;
-		}
+	    } elsif($iq->signature eq 'set-{'.INVISIBLE.'}invisible' or $iq->signature eq 'set-{'.INVISIBLE.'}visible') {
+		$logger->info("Visibility Mode: ".$iq->as_xml);
+		$self->set_visibility($iq);
+		$cb->stop_chain;
+	    }
+	} elsif(($iq->isa("DJabberd::IQ") || $iq->isa("DJabberd::Presence") || $iq->isa("DJabberd::Message")) and $iq->to) {
+	    $logger->debug("I:Checking privacy for ".$iq->element_name);
+	    if(my $jid = $self->match_inflight_stanza($iq,'I')) {
+		$self->block($iq,$jid);
+		$cb->stop_chain;
+		return;
 	    }
 	}
 	$cb->decline;
@@ -129,6 +135,7 @@ sub register {
     };
     my $deliver_cb = sub {
 	my ($vh, $cb, $iq) = @_;
+	return $self unless($vh);
 	if(($iq->isa("DJabberd::IQ") || $iq->isa("DJabberd::Presence") || $iq->isa("DJabberd::Message")) && defined $iq->from && defined $iq->to) {
 	    $logger->debug("D:Checking privacy for ".$iq->element_name);
 	    if(my $jid = $self->match_inflight_stanza($iq)) {
@@ -159,6 +166,7 @@ sub register {
 	$cb->decline;
     };
     $self->{vhost} = $vhost;
+    Scalar::Util::weaken($self->{vhost});
     # Hook used mostly for default list and s2s delivery
     $vhost->register_hook("deliver",$deliver_cb);
     # Hook used mostly for active list inbound filtering
@@ -170,6 +178,7 @@ sub register {
     $vhost->register_hook("ConnectionClosing",$cleanup_cb);
     $vhost->add_feature(PRIVACY);
     $vhost->add_feature(BLOCKING);
+    $vhost->add_feature(INVISIBLE);
 }
 
 sub vhost {
@@ -286,7 +295,11 @@ sub query_privacy {
 sub is_blocking_item {
     my $item = shift;
     # Type: JID; Action: Deny; Stanzas: All - that one is proper blocklist item. Anything else - does not comply, living in privacy list space only
-    return (exists $item->{type} && $item->{type} eq 'jid' && $item->{action} eq 'deny' && !($item->{elements} && ref($item->{elements}) eq 'HASH' && %{$item->{elements}}));
+    return (exists $item->{type} && $item->{type} eq 'jid' && $item->{action} eq 'deny' && !($item->{element} && ref($item->{element}) eq 'HASH' && %{$item->{element}}));
+}
+sub is_invis_item {
+    my ($i) = @_;
+    return (exists $i->{element} && ref($i->{element}) eq 'HASH' && scalar(keys(%{$i->{element}})) == 1 && $i->{element}->{'presence-out'} && $i->{action} eq 'deny' && !$i->{type} && !$i->{value});
 }
 
 =head2 query_blocking($self,$iq)
@@ -370,8 +383,6 @@ set. Moreover, it's used even for offline delivery. If list attribute is empty
 
 =cut
 
-# TODO: XEP-0016 2.10 says we need to send presence unavailable to the client which just blocked incoming presence
-# tracking this though is a bit tough - user may set it right in active list or he may activate preset list
 sub set_privacy {
     my $self = shift;
     my $iq = shift;
@@ -391,6 +402,7 @@ sub set_privacy {
 	    }
 	    if($el->element_name eq 'active') {
 		# Active is single-use, no dependencies
+		$self->chk_presence($list,$jid);
 		$self->set_active_priv_list($jid,$list);
 	    } elsif($el->element_name eq 'default') {
 		my $def = $self->get_default_priv_list($jid);
@@ -405,6 +417,7 @@ sub set_privacy {
 			$self->fail($iq,'conflict');
 			return;
 		    }
+		    $self->chk_presence($list,$jid);
 		    $self->set_default_priv_list($jid,$list);
 		}
 	    }
@@ -427,7 +440,9 @@ sub set_privacy {
 				    or ($att{'{}type'} eq 'jid' || $att{'{}type'} eq 'subscription' || $att{'{}type'} eq 'group'
 				    and exists $att{'{}value'})) {
 				# Mandatory attribute validation
-				if(exists $att{'{}order'} && $att{'{}order'} >= 0 and exists $att{'{}action'} && $att{'{}action'} =~ /allow|deny/) {
+				if(exists $att{'{}order'} && $att{'{}order'} >= 0 and 
+				    exists $att{'{}action'} && $att{'{}action'} =~ /allow|deny/)
+				{
 				    if(exists $att{'{}type'}) {
 					$item->{type} = $att{'{}type'};
 					$item->{value} = $att{'{}value'};
@@ -435,11 +450,9 @@ sub set_privacy {
 				    }
 				    $item->{order} = $att{'{}order'};
 				    $item->{action} = $att{'{}action'};
-				    if($ce->children) {
-					# Optional stanza type elements
-					$item->{element} = {map{$_->element_name=>1}$ce->children};
-				    }
-				    if(!grep{!/(iq|message|presence-in|presence-out)/}keys(%{$item->{element} || {}})) {
+				    # Optional stanza type elements
+				    $item->{element} = {map{$_->element_name=>1}$ce->children};
+				    if(!grep{!/(iq|message|presence-in|presence-out)/}keys(%{$item->{element}})) {
 					# Final check that we didn't assign some trash to the elements
 					push(@items,$item);
 					next;
@@ -476,15 +489,20 @@ sub set_privacy {
 		    $iq->send_result();
 		    if($sr>0) {
 			# Then broadcast modified list name to all connected resources (XEP-0016 2.6)
-			my $lq = "<query xmlns='".PRIVACY."'><list name='$name' /></query>";
-			foreach my $c ($self->vhost->find_conns_of_bare($jid)) {
-			    # Need to follow roster push way as initial presence might not yet be sent
-			    my $id = $c->new_iq_id;
-			    my $to = $c->bound_jid->as_string;
-			    my $xml = "<iq type='set' to='$to' id='$id'>$lq</iq>";
-			    $c->log_outgoing_data($xml);
-			    $c->write(\$xml);
+			$self->bcast_list_update($jid,$name);
+		    }
+		    # Now update active or default and emit presence if it is
+		    if($self->is_default_list($jid,$list)) {
+			# Collect all active users of the default list
+			my @jids = ();
+			foreach my$c($self->vhost->find_conns_of_bare($jid)) {
+			    my $l = $self->get_active_priv_list($c->bound_jid);
+			    push(@jids,$c->bound_jid->as_string) if(!$l || $l->{name} eq $name);
 			}
+			# And distribute presence according to filters
+			$self->chk_presence($jid,$list,0,{},{},@jids);
+		    } elsif($self->is_active_list($jid,$list)) {
+			$self->chk_presence($list,$jid);
 		    }
 		} else {
 		    # happens
@@ -495,6 +513,172 @@ sub set_privacy {
 	}
     }
     $self->fail($iq,0,'modify');
+}
+sub bcast_list_update {
+    my ($self,$jid,$name)=@_;
+    my $lq = "<query xmlns='".PRIVACY."'><list name='$name' /></query>";
+    foreach my $c ($self->vhost->find_conns_of_bare($jid)) {
+	# Need to follow roster push way as initial presence might not yet be sent
+	my $id = $c->new_iq_id;
+	my $to = $c->bound_jid->as_string;
+	my $xml = "<iq type='set' to='$to' id='$id'>$lq</iq>";
+	$c->log_outgoing_data($xml);
+	$c->write(\$xml);
+    }
+}
+# XEP-0016 2.10 says we need to send presence unavailable to the client which just blocked incoming presence
+# also when we blocked presence to someone else - we should send to him unavailable presence
+sub chk_presence {
+    my $self = shift;
+    my $list = shift;
+    my $jid = shift;
+    my $roster = shift;
+    my $pi = shift || {};
+    my $po = shift || {};
+    my @fj = @_;
+    my @pi = grep {(!%{$_->{element}} || $_->{element}->{'presence-in'})  && $_->{action} eq 'deny'} @{$list->{items}};
+    my @po = grep {(!%{$_->{element}} || $_->{element}->{'presence-out'}) && $_->{action} eq 'deny'} @{$list->{items}};
+    foreach my$i(@pi) {
+	if($i->{type} && $i->{type} eq 'jid') {
+	    # explicit meh, just send it
+	    $pi->{$i->{value}} = 1;
+	} else {
+	    # Walk the roster and unavail all/matching
+	    if(!$roster) {
+		$self->vhost->run_hook_chain(phase => "RosterGet", args => [ $jid ],
+		    methods => {
+			set_roster => sub {
+			    $self->chk_presence($list,$jid,$_[0],$pi,$po,@fj);
+			}
+		    }
+		);
+		return;
+	    }
+	    foreach my$ri($roster->to_items) {
+		if(!$pi->{$ri->jid->as_string} && (!$i->{type} or ritem_match($ri,$i))) {
+		    $pi->{$ri->jid->as_string} = 1;
+		}
+	    }
+	}
+    }
+    foreach my$i(@po) {
+	if($i->{type} && $i->{type} eq 'jid') {
+	    $po->{$i->{value}} = 1;
+	} else {
+	    if(!$roster) {
+		$self->vhost->run_hook_chain(phase => "RosterGet", args => [ $jid ],
+		    methods => {
+			set_roster => sub {
+			    $self->chk_presence($list,$jid,$_[0],$pi,$po,@fj);
+			}
+		    }
+		);
+		return;
+	    }
+	    foreach my$ri($roster->from_items) {
+		if(!$po->{$ri->jid->as_string} && (!$i->{type} or ritem_match($ri,$i))) {
+		    $po->{$ri->jid->as_string} = 1;
+		}
+	    }
+	}
+    }
+    my $p = DJabberd::Presence->unavailable_stanza;
+    foreach my$j(keys(%{$pi})) {
+	if(@fj) {
+	    foreach my$fj(@fj) {
+		$p->set_from($j);
+		$p->set_to($fj);
+		$p->deliver($self->vhost);
+	    }
+	} else {
+	    $p->set_from($j);
+	    $p->set_to($jid->as_string);
+	    $p->deliver($self->vhost);
+	}
+    }
+    foreach my$j(keys(%{$po})) {
+	if(@fj) {
+	    foreach my$fj(@fj) {
+		$p->set_from($fj);
+		$p->set_to($j);
+		$p->deliver($self->vhost);
+	    }
+	} else {
+	    $p->set_from($jid->as_string);
+	    $p->set_to($j);
+	    $p->deliver($self->vhost);
+	}
+    }
+    return $roster;
+}
+
+=head2 set_visibility($self,$iq)
+
+This method handles XEP-0186 Invisible Commands.
+
+It uses underlying Privacy List engine in accordance with XEP-0126 to implement
+presence filtering for invisibility. XEP mandates invisibility to be applicable
+only to the session, hence invisible command operates only on active list.
+
+When list does not exist it creates one, named 'invisible' (as Telepathy does).
+
+For C<visible> command it tries to remove C<presence-out> list items and if
+resulting list is empty it just deactivates it. Otherwise it modifies and stores
+the list, keeping it active with remaining items.
+
+=cut
+
+sub set_visibility {
+    my $self = shift;
+    my $iq = shift;
+    my $op = $iq->first_element->element_name;
+    my $jid = $iq->connection->bound_jid;
+    my $list = $self->get_active_priv_list($jid);
+    my %invis;
+    if($list && ref($list) eq 'HASH' && exists $list->{name}) {
+	%invis = map{$_->{order} => $_}grep {is_invis_item($_)} @{$list->{items}};
+    } else {
+	$list = { name => 'invis-'.$iq->id, items => [], temp=>1};
+    }
+    if($op eq 'invisible' && !%invis) {
+	# Ignore if we have some active list which blocks presence
+	$logger->debug("Inserting pres-out block to ".$list->{name});
+	if(@{$list->{items}} && $list->{items}->[0]->{order} <= 1) {
+	    # Renumber order value to allow new 1
+	    foreach my$i(1..(scalar(@{$list->{items}}))) {
+		$list->{items}->[$i-1]->{order} = $i+1;
+	    }
+	}
+	unshift(@{$list->{items}}, {action=>'deny',element=>{'presence-out' => 1}, order=>1});
+	$self->set_active_priv_list($jid,$list);
+	# Now need to broadcast unavailable presence - if we're past initial presence
+	if($iq->connection->is_available) {
+	    my $pres = DJabberd::Presence->unavailable_stanza;
+	    $pres->broadcast_from($iq->connection);
+	}
+	$self->bcast_list_update($jid,$list->{name})
+	    if(!$list->{temp} && $self->set_priv_list($jid,$list));
+    } elsif($op eq 'visible' && %invis) {
+	# Ignore unless presence is blocked by active list
+	my @items = grep{!exists$invis{$_->{order}}}@{$list->{items}};
+	if(@items && !$list->{temp}) {
+	    # Something is left there, need to modify and keep
+	    $logger->debug("Removing presence filters from list ".$list->{name});
+	    $list->{items} = [@items];
+	    $self->set_active_priv_list($jid,$list);
+	    $self->bcast_list_update($jid,$list->{name}) if($self->set_priv_list($jid,$list));
+	} else {
+	    # Pure visibility list, just discard active list
+	    $logger->debug("Deactivating visibility list ".$list->{name});
+	    $self->set_active_priv_list($jid);
+	}
+    } else {
+	$logger->debug("Nothing to be done, everything is as requested: ".$list->{name}."/".join(', ',keys(%invis)));
+    }
+    my $to = $iq->from || $iq->connection->bound_jid->as_string;
+    my $xml = "<iq type='result' id='".$iq->id."' to='$to'/>";
+    $iq->connection->log_outgoing_data($xml);
+    $iq->connection->write(\$xml);
 }
 
 =head2 set_blocking($self,$iq)
@@ -529,7 +713,7 @@ sub set_blocking {
     if($list && ref($list) eq 'HASH' && exists $list->{name}) {
 	$active = 1;
     } else {
-	$list = { name => 'autoblocklist', items => []};
+	$list = { name => 'block', items => []};
     }
     if($#kids >= 0) {
 	# We cannot unblock someone in empty list
@@ -585,16 +769,20 @@ sub set_blocking {
 	    return;
 	}
     }
-    # And yes, XEP-0191 allows updating list which is in use, just notify users
-    $self->set_default_priv_list($jid,$list);
     # Even if we fail to persistently store it - list will still be cached and hence active, so let's ack it
     $iq->send_result;
+    # send presence to all affected blocks (if they are subscribed)
+    # TODO: get roster and check presence subscription
+    foreach my $pst(@presence) {
+	$pst->deliver($self->vhost);
+    }
+    $self->set_default_priv_list($jid,$list);
     # Broadcast modifications to all connected resources
     # Those which requested block list - receive original change [XEP-0191 3.3.8], others - priv.list name [XEP-0016 2.6]
     $iq->set_from;
     my $piq = DJabberd::IQ->new('','iq',{type=>'set'},[],'<query xmlns="'.PRIVACY.'"><list name="'.$list->{name}.'" /></query>') if($active);
     foreach my $c ($self->vhost->find_conns_of_bare($jid)) {
-	next if($c->bound_jid->as_string eq $jid->as_string);
+	next if($c->bound_jid->as_string eq $jid->as_string); # skip self, 0191 does not need that
 	if($self->{blkiq}->{$c->bound_jid->as_string}) {
 	    $iq->set_to($c->bound_jid);
 	    $iq->deliver($c);
@@ -603,11 +791,6 @@ sub set_blocking {
 	    $piq->set_to($c->bound_jid);
 	    $piq->deliver($c);
 	}
-    }
-    # send presence to all affected blocks (if they are subscribed)
-    # TODO: get roster and check presence subscription
-    foreach my $pst(@presence) {
-	$pst->deliver($self->vhost);
     }
 }
 
@@ -636,8 +819,7 @@ returns active privacy list for the given JID.
 
 The JID is DJabberd::JID object and should be fully qualified
 (node@domain/resource). Method checks for existance in memory cache. Returns
-empty
-
+undef if active list is not set for the session (represented by full jid).
 
 =cut
 
@@ -654,6 +836,13 @@ sub is_cached_priv_list {
     my $jids = shift;
     my $name = shift;
     return (exists $self->{lists}->{$jids} && ref($self->{lists}->{$jids}) eq 'HASH' && exists $self->{lists}->{$jids}->{name} && $self->{lists}->{$jids}->{name} eq $name);
+}
+sub is_default_list {
+    return $_[0]->is_cached_priv_list($_[1]->as_bare_string,$_[2]);
+}
+
+sub is_active_list {
+    return $_[0]->is_cached_priv_list($_[1]->as_string,$_[2]);
 }
 
 =head2 set_default_priv_list($self,$jid,$list)
@@ -705,7 +894,8 @@ Stores the list into persistent storage for given JID.
 The JID must be DJabberd::JID object and the list a hashref. If the list with
 this name is cached as active or default - will also update the cache.
 
-If the hashref is empty - indicates removal of the list.
+If the hashref's {items} element is empty or missing - indicates removal of the
+list.
 
 =cut
 
@@ -885,6 +1075,17 @@ sub match_priv_list {
 	    if($stanza->isa("DJabberd::Presence") && exists$item->{element}->{"presence-$dir"}) {
 		# XEP-0016 2.10, 2.11 - only ignore presence state, not probe/subscription
 		next if($stanza->type && $stanza->type ne 'unavailable');
+		# XEP-0186 also allows passing directed presence, so... presence is directed if
+		# it has to(is directed), it's from client connection where from_jid=bound_jid,
+		# it's presence state. And the filter is catch-all, not target-specific
+		next if($dir eq 'out' && $jido && $stanza->connection && !$stanza->connection->is_server
+			&& $stanza->connection->bound_jid && $stanza->connection->bound_jid->eq($jidu)
+			&& !(exists $item->{type} && $item->{type})
+		    );
+		# So <presence/> won't be filtered bcz on switch_incoming_client we require <to>
+		# directed will pass the filter but will hit the above condition and be excluded
+		# in the delivery phase broadcasted reflected pres have no connection - no match
+		# but directed will keep its connection and hence will match the above exclusion
 	    } else {
 		# skip this rule, it's typed but stanza type is different, or it's outbound
 		next if($dir eq 'out' or !$item->{element}->{$stanza->element_name});
@@ -1016,7 +1217,7 @@ Internally list structure is represented as HASH reference with following layout
       { # item 1
 	action => '<allow|deny>',
 	type => '<jid|group|subscription>', value => '<value>', # optional
-	elements => {		# optional, with any combination of below
+	element => {		# optional, with any combination of below
 	  iq => 1,
 	  message => 1,
 	  'presence-in' => 1,
