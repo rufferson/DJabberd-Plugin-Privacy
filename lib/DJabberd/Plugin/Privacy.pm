@@ -140,7 +140,7 @@ sub register {
 	$cb->decline;
     };
     my $cleanup_cb = sub {
-	my ($vh, $cb, $conn, $pres) = @_;
+	my ($vh, $cb, $conn) = @_;
 	# Remove active lists for closing sessions - if any
 	if($conn->isa("DJabberd::Connection::ClientIn")) {
 	    my $jid = $conn->bound_jid;
@@ -167,7 +167,6 @@ sub register {
     # Hook used for management and outbound filtering
     $vhost->register_hook("switch_incoming_client",$manage_cb);
     # Hooks used to clean up any associated cached elements
-    $vhost->register_hook("AlterPresenceUnavailable",$cleanup_cb);
     $vhost->register_hook("ConnectionClosing",$cleanup_cb);
     $vhost->add_feature(PRIVACY);
     $vhost->add_feature(BLOCKING);
@@ -409,19 +408,25 @@ sub set_privacy {
 		$self->set_active_priv_list($jid,$list);
 	    } elsif($el->element_name eq 'default') {
 		my $def = $self->get_default_priv_list($jid);
-		# If default list is defined and differs from this one
-		if($def && ref($def) eq 'HASH' && $def->{name} ne $name) {
+		# If default list is defined and differs from this one - check for conflicts
+		if($def && ref($def) eq 'HASH' && $def->{name} && (!$name || $def->{name} ne $name)) {
 		    # Need to check for conflicts - don't change default in use by other connected users (silly)
 		    foreach my $c($self->vhost->find_conns_of_bare($jid)) {
 			# basically we're checking if other resources having own(active) list or rely on default
 			my $bj=$c->bound_jid->as_string;
+			next if($bj eq $jid->as_string); # skip self
 			next if(exists $self->{$bj} && ref($self->{$bj}) eq 'HASH'); # this one has active, skip
 			# no active list, client is using default, hence conflict
 			$self->fail($iq,'conflict');
 			return;
 		    }
+		}
+		if($list) {
 		    $self->chk_presence($list,$jid);
 		    $self->set_default_priv_list($jid,$list);
+		} else {
+		    $logger->debug("Detaching default list for ".$jid->as_bare_string);
+		    $self->set_default_priv_list($jid,{});
 		}
 	    }
 	    $iq->send_result;
@@ -474,14 +479,14 @@ sub set_privacy {
 		    # ... Strange that it's not required for list modifications.
 		    # First check whether it is default list
 		    my $def = $self->get_default_priv_list($jid);
-		    $def=($def && $def->{name} eq $name);
+		    $def=($def && ref($def) && $def->{name} && $def->{name} eq $name);
 		    # Then check other online resources
 		    foreach my $c($self->vhost->find_conns_of_bare($jid)) {
 			my $bj=$c->bound_jid->as_string;
 			# If uses our list as active OR doesn't use active but our is default - it's a conflict
 			if((exists $self->{$bj} && ref($self->{$bj}) eq 'HASH' && $self->{$bj}->{name} eq $name)
 			    or ((!exists $self->{$bj} || !$self->{$bj}) && $def)) {
-			    $self->fail('conflict');
+			    $self->fail($iq,'conflict');
 			    return;
 			}
 		    }
@@ -509,7 +514,7 @@ sub set_privacy {
 		    }
 		} else {
 		    # happens
-		    $self->fail('service-unavailable');
+		    $self->fail($iq,'service-unavailable');
 		}
 		return;
 	    }
@@ -880,7 +885,8 @@ sub set_default_priv_list {
     return undef unless($list && ref($list));
     $list->{default} = 1;
     $self->{lists}->{$jid->as_bare_string} = $list;
-    return $self->store_priv_list($jid,$list);
+    return $self->store_priv_list($jid,$list) if(exists $list->{name} && $list->{name});
+    return $list;
 }
 
 =head2 get_default_priv_list($self,$jid)
@@ -1223,7 +1229,7 @@ sub block {
 	} else {
 	    $err = $stanza->make_error_response(503,'cancel','service-unavailable');
 	}
-	$err->deliver;
+	$err->deliver($self->vhost);
     }
 }
 
