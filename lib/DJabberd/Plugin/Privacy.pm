@@ -7,7 +7,8 @@ use base 'DJabberd::Plugin';
 use constant {
 	PRIVACY => "jabber:iq:privacy",
 	BLOCKING => "urn:xmpp:blocking",
-	INVISIBLE => "urn:xmpp:invisible:0",
+	INVISNS0 => "urn:xmpp:invisible:0",
+	INVISNS1 => "urn:xmpp:invisible:1",
 };
 
 our $logger = DJabberd::Log->get_logger();
@@ -80,35 +81,27 @@ and urn:xmpp:blocking
 
 =cut
 
-use Data::Dumper;
+my %callmap = (
+    'get-{'.PRIVACY.'}query' => \&query_privacy,
+    'set-{'.PRIVACY.'}query' => \&set_privacy,
+    'get-{'.BLOCKING.'}blocklist' => \&query_blocking,
+    'set-{'.BLOCKING.'}block' => \&set_blocking,
+    'set-{'.BLOCKING.'}unblock' => \&set_blocking,
+    'set-{'.INVISNS0.'}visible' => \&set_visibility,
+    'set-{'.INVISNS0.'}invisible' => \&set_visibility,
+    'set-{'.INVISNS1.'}visible' => \&set_visibility,
+    'set-{'.INVISNS1.'}invisible' => \&set_visibility,
+);
+#use Data::Dumper;
 sub register {
     my ($self,$vhost) = @_;
     my $manage_cb = sub {
 	my ($vh, $cb, $iq) = @_;
 	if($iq->isa("DJabberd::IQ") && !$iq->to) {
-	    if ($iq->signature eq 'get-{'.PRIVACY.'}query') {
-		$logger->debug("Privacy Query: ".$iq->as_xml);
-		$self->query_privacy($iq);
-		$cb->stop_chain;
-		return;
-	    } elsif ($iq->signature eq 'set-{'.PRIVACY.'}query') {
-		$logger->debug("Privacy Modify: ".$iq->as_xml);
-		$self->set_privacy($iq);
-		$cb->stop_chain;
-		return;
-	    } elsif($iq->signature eq 'get-{'.BLOCKING.'}blocklist') {
-		$logger->info("Blocking Query: ".$iq->as_xml);
-		$self->query_blocking($iq);
-		$self->{blkiq}->{$iq->from} = 1; # remember this one - block list user
-		$cb->stop_chain;
-	    } elsif($iq->signature eq 'set-{'.BLOCKING.'}block' or $iq->signature eq 'set-{'.BLOCKING.'}unblock') {
-		$logger->info("Blocking/Unblocking: ".$iq->as_xml);
-		$self->set_blocking($iq);
-		$cb->stop_chain;
-	    } elsif($iq->signature eq 'set-{'.INVISIBLE.'}invisible' or $iq->signature eq 'set-{'.INVISIBLE.'}visible') {
-		$logger->info("Visibility Mode: ".$iq->as_xml);
-		$self->set_visibility($iq);
-		$cb->stop_chain;
+	    if(exists $callmap{$iq->signature}) {
+		$logger->debug("Privacy handler ".$iq->signature);
+		$callmap{$iq->signature}->($self,$iq);
+		return $cb->stop_chain;
 	    }
 	} elsif(($iq->isa("DJabberd::IQ") || $iq->isa("DJabberd::Presence") || $iq->isa("DJabberd::Message")) and $iq->to) {
 	    $logger->debug("I:Checking privacy for ".$iq->element_name);
@@ -178,7 +171,8 @@ sub register {
     $vhost->register_hook("ConnectionClosing",$cleanup_cb);
     $vhost->add_feature(PRIVACY);
     $vhost->add_feature(BLOCKING);
-    $vhost->add_feature(INVISIBLE);
+    $vhost->add_feature(INVISNS0);
+    $vhost->add_feature(INVISNS1);
 }
 
 sub vhost {
@@ -297,9 +291,17 @@ sub is_blocking_item {
     # Type: JID; Action: Deny; Stanzas: All - that one is proper blocklist item. Anything else - does not comply, living in privacy list space only
     return (exists $item->{type} && $item->{type} eq 'jid' && $item->{action} eq 'deny' && !($item->{element} && ref($item->{element}) eq 'HASH' && %{$item->{element}}));
 }
+
 sub is_invis_item {
     my ($i) = @_;
-    return (exists $i->{element} && ref($i->{element}) eq 'HASH' && scalar(keys(%{$i->{element}})) == 1 && $i->{element}->{'presence-out'} && $i->{action} eq 'deny' && !$i->{type} && !$i->{value});
+    return (exists $i->{element} && ref($i->{element}) eq 'HASH' && scalar(keys(%{$i->{element}})) == 1 && $i->{element}->{'presence-out'} && $i->{action} eq 'deny'
+	    && !(exists $i->{type} && $i->{type}) && !(exists $i->{value} && $i->{value}));
+}
+
+sub is_invis_probe {
+    my ($i) = @_;
+    return (exists $i->{element} && ref($i->{element}) eq 'HASH' && scalar(keys(%{$i->{element}})) == 1 && $i->{element}->{'presence-out'} && $i->{action} eq 'deny'
+	    && exists $i->{type} && $i->{type} && $i->{type} eq 'probe' && !(exists $i->{value} && $i->{value}));
 }
 
 =head2 query_blocking($self,$iq)
@@ -326,6 +328,7 @@ sub query_blocking {
 	}
     }
     $iq->send_result_raw($bloxml);
+    $self->{blkiq}->{$iq->from} = 1; # remember this one - block list user
 }
 
 =head2 set_privacy($self,$iq)
@@ -649,7 +652,9 @@ sub set_visibility {
 		$list->{items}->[$i-1]->{order} = $i+1;
 	    }
 	}
-	unshift(@{$list->{items}}, {action=>'deny',element=>{'presence-out' => 1}, order=>1});
+	my $item = {action=>'deny',element=>{'presence-out' => 1}, order=>1};
+	$item->{type} = 'probe' unless($iq->first_element->attr('{}probe'));
+	unshift(@{$list->{items}}, $item);
 	$self->set_active_priv_list($jid,$list);
 	# Now need to broadcast unavailable presence - if we're past initial presence
 	if($iq->connection->is_available) {
@@ -672,6 +677,19 @@ sub set_visibility {
 	    $logger->debug("Deactivating visibility list ".$list->{name});
 	    $self->set_active_priv_list($jid);
 	}
+    # Let's catch a case when only probe state is changing
+    } elsif($op eq 'invisible' && %invis && $iq->first_element->attr('{}probe') && !grep{is_invis_probe($_)}values(%invis)) {
+	$logger->debug("Enabling probe filtering on list ".$list->{name});
+	foreach(@{$list->{items}}) {
+	    $_->{type}='probe' if(is_invis_item($_));
+	}
+	$self->set_active_priv_list($jid,$list);
+    } elsif($op eq 'invisible' && %invis && !$iq->first_element->attr('{}probe') && grep{is_invis_probe($_)}values(%invis)) {
+	$logger->debug("Disabling probe filtering on list ".$list->{name});
+	foreach(@{$list->{items}}) {
+	    delete $_->{type} if(is_invis_probe($_));
+	}
+	$self->set_active_priv_list($jid,$list);
     } else {
 	$logger->debug("Nothing to be done, everything is as requested: ".$list->{name}."/".join(', ',keys(%invis)));
     }
@@ -1074,6 +1092,9 @@ sub match_priv_list {
 	    #$logger->debug("Checking elements: ".join(',',keys(%{$item->{element}})));
 	    if($stanza->isa("DJabberd::Presence") && exists$item->{element}->{"presence-$dir"}) {
 		# XEP-0016 2.10, 2.11 - only ignore presence state, not probe/subscription
+		# XEP-0186 3.1 however suggests to optionally block outgoing 'probe' as well
+		return $item->{action} eq 'deny'
+		    if(is_invis_probe($item) && $stanza->type && $stanza->type eq 'probe');
 		next if($stanza->type && $stanza->type ne 'unavailable');
 		# XEP-0186 also allows passing directed presence, so... presence is directed if
 		# it has to(is directed), it's from client connection where from_jid=bound_jid,
