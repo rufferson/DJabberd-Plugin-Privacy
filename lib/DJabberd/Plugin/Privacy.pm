@@ -294,7 +294,7 @@ sub is_blocking_item {
 sub is_invis_item {
     my ($i) = @_;
     return (exists $i->{element} && ref($i->{element}) eq 'HASH' && scalar(keys(%{$i->{element}})) == 1 && $i->{element}->{'presence-out'} && $i->{action} eq 'deny'
-	    && !(exists $i->{type} && $i->{type}) && !(exists $i->{value} && $i->{value}));
+	    && (!(exists $i->{type} && $i->{type}) || $i->{type} eq 'probe') && !(exists $i->{value} && $i->{value}));
 }
 
 sub is_invis_probe {
@@ -658,14 +658,15 @@ sub set_visibility {
 	    }
 	}
 	my $item = {action=>'deny',element=>{'presence-out' => 1}, order=>1};
-	$item->{type} = 'probe' unless($iq->first_element->attr('{}probe'));
+	$item->{type} = 'probe'
+	    if($iq->first_element->namespace ne INVISNS0 && !$iq->first_element->attr('{}probe'));
 	unshift(@{$list->{items}}, $item);
-	$self->set_active_priv_list($jid,$list);
 	# Now need to broadcast unavailable presence - if we're past initial presence
 	if($iq->connection->is_available) {
 	    my $pres = DJabberd::Presence->unavailable_stanza;
 	    $pres->broadcast_from($iq->connection);
 	}
+	$self->set_active_priv_list($jid,$list);
 	$self->bcast_list_update($jid,$list->{name})
 	    if(!$list->{temp} && $self->set_priv_list($jid,$list));
     } elsif($op eq 'visible' && %invis) {
@@ -1100,7 +1101,8 @@ sub match_priv_list {
 		# XEP-0016 2.10, 2.11 - only ignore presence state, not probe/subscription
 		# XEP-0186 3.1 however suggests to optionally block outgoing 'probe' as well
 		return $item->{action} eq 'deny'
-		    if(is_invis_probe($item) && $stanza->type && $stanza->type eq 'probe');
+		    if(is_invis_probe($item) &&
+			(!$stanza->type || $stanza->type eq 'unavailable' || $stanza->type eq 'probe'));
 		next if($stanza->type && $stanza->type ne 'unavailable');
 		# XEP-0186 also allows passing directed presence, so... presence is directed if
 		# it has to(is directed), it's from client connection where from_jid=bound_jid,
