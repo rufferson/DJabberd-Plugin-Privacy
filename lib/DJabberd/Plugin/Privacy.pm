@@ -316,17 +316,19 @@ sub query_blocking {
     my $self = shift;
     my $iq = shift;
     my $jid = $iq->connection->bound_jid;
-    my $bloxml;
+    my $bloxml = '';
     my $list = $self->get_default_priv_list($jid);
     if($list && ref($list) eq 'HASH' && exists $list->{name}) {
 	$logger->debug("Using default list ".$list->{name}." as blocklist");
 	foreach my $item(@{$list->{items}}) {
 	    if(is_blocking_item($item)) {
-		$bloxml = ($bloxml || "").'<item jid="'.$item->{value}.'"/>';
+		$bloxml .= '<item jid="'.$item->{value}.'"/>';
 	    }
 	}
     }
-    $iq->send_result_raw($bloxml);
+    my $block = $iq->first_element->clone;
+    $block->set_raw($bloxml);
+    $iq->send_result_raw($block->as_xml);
     $self->{blkiq}->{$iq->from} = 1; # remember this one - block list user
 }
 
@@ -1175,6 +1177,11 @@ sub match_inflight_stanza {
     my $to =   ($fdir eq 'O') ? $stanza->connection->bound_jid : $stanza->to_jid;
     my $ret;
     my $list;
+    if(!ref($from) || !ref($to)) {
+	$logger->warn("Abnormal jid state: '$from' '$to'");
+	$logger->debug("Stanza dump: ".Dumper($stanza));
+	return 0;
+    }
     # Specification explicitly denies blocking cross-resource stanzas, even if explicit list item is defined.
     return 0 if($from->as_bare_string eq $to->as_bare_string);
     # First check inbound stanzas - recipient's list if recipient is local
